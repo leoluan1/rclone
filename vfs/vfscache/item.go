@@ -69,6 +69,9 @@ type Item struct {
 	writeBackID     writeback.Handle         // id of any writebacks in progress
 	pendingAccesses int                      // number of threads - cache reset not allowed if not zero
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
+	recentAccesses  []AccessRec              // recent read access history for detecting sequential accesses
+	seqAcc          []SeqAccess              // sequential access streams
+	inSeqCnt        int
 }
 
 // Info is persisted to backing store
@@ -79,6 +82,20 @@ type Info struct {
 	Rs          ranges.Ranges // which parts of the file are present
 	Fingerprint string        // fingerprint of remote object
 	Dirty       bool          // set if the backing file has been modified
+}
+
+// AccessRec records a recent read access
+type AccessRec struct {
+	Range ranges.Range // range of this access
+	ATime time.Time    // time of this access
+	InSeq bool         // belong to a sequential access stream
+}
+
+// SeqAccess tracks a sequential access stream
+type SeqAccess struct {
+	Range ranges.Range // range of this sequential access so far
+	Score int64        // heuristic score for prefetching value
+	STime time.Time    // time we start tracking this stream
 }
 
 // Items are a slice of *Item ordered by ATime
@@ -118,6 +135,13 @@ func (v Items) Less(i, j int) bool {
 	return iItem.info.ATime.Before(jItem.info.ATime)
 }
 
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // clean the item after its cache file has been deleted
 func (info *Info) clean() {
 	*info = Info{}
@@ -139,6 +163,8 @@ func newItem(c *Cache, name string) (item *Item) {
 			ATime:   now,
 		},
 	}
+	item.recentAccesses = nil
+	item.seqAcc = nil
 	item.cond = sync.NewCond(&item.mu)
 	// check the cache file exists
 	osPath := c.toOSPath(name)
@@ -1091,6 +1117,25 @@ func (item *Item) FindMissing(r ranges.Range) (outr ranges.Range) {
 	return outr
 }
 
+// FindMissingRanges adjusts r returning a new ranges.Ranges which only
+// contains the range(s) which need(s) to be downloaded. This could be
+// empty - check with IsEmpty. It also adjust this to make sure it is
+// not larger than the file.
+func (item *Item) findMissingRanges(r ranges.Range) (missingRs ranges.Ranges) {
+	// item.mu.Lock()
+	// defer item.mu.Unlock()
+	// Clip returned block to size of file
+	r.Clip(item.info.Size)
+	outrs := item.info.Rs.FindAll(r)
+	missingRs = nil
+	for _, fr := range outrs {
+		if !fr.Present {
+			missingRs.Insert(fr.R)
+		}
+	}
+	return missingRs
+}
+
 // ensure the range from offset, size is present in the backing file
 //
 // call with the item lock held
@@ -1207,6 +1252,146 @@ func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 	return n, err
 }
 
+// Reevaluate sequential access patterns
+func (item *Item) reevalSeq() {
+	item.seqAcc = nil
+	var recentRanges ranges.Ranges
+	var nSeq SeqAccess
+	for _, access := range item.recentAccesses {
+		recentRanges.Insert(access.Range)
+	}
+	var gapRange ranges.Range
+	var gapSize int64
+	var fuzzyRanges ranges.Ranges
+	recentRangeCnt := len(recentRanges)
+	for i := 0; i < recentRangeCnt-1; i++ {
+		fuzzyRanges.Insert(recentRanges[i])
+		gapSize = recentRanges[i+1].Pos - recentRanges[i].Pos - recentRanges[i].Size
+		if gapSize <= 256*1024 {
+			gapRange = ranges.Range{Pos: recentRanges[i].End(), Size: gapSize}
+			fuzzyRanges.Insert(gapRange)
+		}
+	}
+	fuzzyRanges.Insert(recentRanges[recentRangeCnt-1])
+	threshold := fuzzyRanges.Size() / int64(len(item.recentAccesses)) * 4
+	for _, r := range fuzzyRanges {
+		if r.Size >= threshold {
+			nSeq.STime = time.Now()
+			nSeq.Range = r
+			nSeq.Score = r.Size
+			item.seqAcc = append(item.seqAcc, nSeq)
+		}
+	}
+
+	item.inSeqCnt = 0
+	for i, access := range item.recentAccesses {
+		item.recentAccesses[i].InSeq = false
+		for j, s := range item.seqAcc {
+			if s.Range.Pos <= access.Range.Pos && s.Range.End() >= access.Range.End() {
+				item.recentAccesses[i].InSeq = true
+				item.inSeqCnt++
+				if item.seqAcc[j].STime.Nanosecond() > access.ATime.Nanosecond() {
+					item.seqAcc[j].STime = access.ATime
+				}
+				break
+			}
+		}
+	}
+}
+
+func (item *Item) updateSeq(na AccessRec) {
+	var fuzzySeqEnd, fuzzySeqBegin, fuzzySeqLimit int64
+	fuzzySeqLimit = 32 * 1024 * 1024
+
+	item.recentAccesses = append(item.recentAccesses, na)
+	historyLen := len(item.recentAccesses)
+	if historyLen <= 32 {
+		if historyLen%4 == 0 {
+			item.reevalSeq()
+		}
+		return
+	}
+
+	fs.Debugf(item.name, "vfs cache: seqAcc %v", item.seqAcc)
+	for i := 0; i < len(item.seqAcc); i++ {
+		fuzzySeqEnd = item.seqAcc[i].Range.Pos + item.seqAcc[i].Range.Size + fuzzySeqLimit
+		fuzzySeqBegin = max(item.seqAcc[i].Range.Pos, item.seqAcc[i].Range.Pos+item.seqAcc[i].Range.Size-fuzzySeqLimit)
+		fs.Debugf(item.name, "vfs cache: fuzzySeqBegin = %v fuzzySeqEnd = %v na.Range = %v",
+			fuzzySeqBegin, fuzzySeqEnd, na.Range)
+		if na.Range.Pos >= fuzzySeqBegin && na.Range.Pos <= fuzzySeqEnd {
+			newSize := max(item.seqAcc[i].Range.Size, na.Range.Pos+na.Range.Size-item.seqAcc[i].Range.Pos)
+			fs.Debugf(item.name,
+				"vfs cache: seqAcc[%v].Range Pos %v old Size %v new Size %v", i, item.seqAcc[i].Range.Pos, item.seqAcc[i].Range.Size, newSize)
+			item.seqAcc[i].Range.Size = newSize
+			item.seqAcc[i].Score += na.Range.Size
+			item.recentAccesses[historyLen-1].InSeq = true
+			break
+			// item.seqAcc[i].ATime = time.Now()
+		}
+	}
+
+	if item.recentAccesses[32].InSeq && !item.recentAccesses[0].InSeq {
+		item.inSeqCnt++
+	} else if !item.recentAccesses[32].InSeq && item.recentAccesses[0].InSeq {
+		item.inSeqCnt--
+	}
+	item.recentAccesses = item.recentAccesses[1:32]
+	if len(item.seqAcc) > 0 && item.inSeqCnt < 4 {
+		item.reevalSeq()
+	}
+	return
+}
+
+// GetSeqPrefs returns the next prefectch ranges for sequential access streams
+func (item *Item) GetSeqPrefs() (nextPrefRanges []ranges.Range) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	// Check whether we have some sequential access streams going
+	// on. Start parallel downloaders for them.
+	prefSize := int64(item.c.opt.SeqReadAhead)
+	// prefChunk := int64(16 * 1024 * 1024)
+	var prefRange, chunkRange, mr ranges.Range
+	var prefRs ranges.Ranges
+	prefRs = nil
+	prefRange.Size = prefSize
+	// chunkCnt := 0
+
+	i := 0
+	for _, stream := range item.seqAcc {
+		KBps := stream.Range.Size * 1000000 / (int64(time.Since(stream.STime) + 1))
+		fs.Debugf(item.name, "vfs cache: bandwidth %d KB/s stream %v", KBps, stream)
+		if KBps >= int64(item.c.opt.SeqThreshold)/1024 {
+			item.seqAcc = append(item.seqAcc, stream) // = append(item.seqAcc[:index], item.seqAcc[index+1:]...)
+			i++
+		}
+	}
+	item.seqAcc = item.seqAcc[:i]
+
+	for _, stream := range item.seqAcc {
+		prefRange.Pos = stream.Range.Pos + stream.Range.Size
+		prefRange.Size = prefSize
+		missingRs := item.findMissingRanges(prefRange)
+		prefChunk := int64(item.c.opt.SeqPrefChunkSize)
+
+		for _, mr = range missingRs { // limit to four 16MB pref chunks
+			for !mr.IsEmpty() {
+				if mr.Size <= prefChunk {
+					chunkRange = mr
+					prefRs = append(prefRs, chunkRange)
+					break
+				}
+				chunkRange.Pos = mr.Pos
+				chunkRange.Size = prefChunk
+				mr.Pos = mr.Pos + prefChunk
+				mr.Size = mr.Size - prefChunk
+				prefRs = append(prefRs, chunkRange)
+				// prefChunk *= 2
+			}
+		}
+	}
+	return prefRs
+}
+
 // ReadAt bytes from the file at off
 func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 	item.mu.Lock()
@@ -1220,7 +1405,19 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 	}
 	defer item.mu.Unlock()
 
+	var access AccessRec
+	curTime := time.Now()
+	access.Range.Pos = off
+	access.Range.Size = int64(len(b))
+	access.ATime = curTime
+	access.InSeq = false // updateSeq will determine whether it's in a sequential access
+	item.updateSeq(access)
+
+	// rBegin := (off >> 20) << 20
+	// rEnd := ((off + int64(len(b)) + 1024*1024 - 1) >> 20) << 20
+
 	err = item._ensure(off, int64(len(b)))
+	// err = item._ensure(rBegin, rEnd-rBegin)
 	if err != nil {
 		return 0, err
 	}

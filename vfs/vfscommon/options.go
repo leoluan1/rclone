@@ -32,6 +32,9 @@ type Options struct {
 	ReadWait          time.Duration // time to wait for in-sequence read
 	WriteBack         time.Duration // time to wait before writing back dirty files
 	ReadAhead         fs.SizeSuffix // bytes to read ahead in cache mode "full"
+	SeqReadAhead	  fs.SizeSuffix // bytes to read ahead in cache mode "full" for sequential reads
+	SeqThreshold	  fs.SizeSuffix // bytes of sequential read to start large sequential read ahead in cache mode "full"
+	SeqPrefChunkSize  fs.SizeSuffix // bytes of prefetch chunk size (one prefetch thread per chunk)
 }
 
 // DefaultOpt is the default values uses for Opt
@@ -58,4 +61,7 @@ var DefaultOpt = Options{
 	ReadWait:          20 * time.Millisecond,
 	WriteBack:         5 * time.Second,
 	ReadAhead:         0 * fs.MebiByte,
+	SeqReadAhead:	   0 * fs.MebiByte,
+	SeqThreshold:	   64 * fs.KibiByte,
+	SeqPrefChunkSize:  1 * fs.MebiByte,
 }

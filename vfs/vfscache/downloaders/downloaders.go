@@ -36,6 +36,15 @@ type Item interface {
 	// not larger than the file.
 	FindMissing(r ranges.Range) (outr ranges.Range)
 
+	// GetSeqAcc returns sequential prefectch ranges
+	GetSeqPrefs() (nextRs []ranges.Range)
+
+	// FindMissingRanges identifies all the ranges that are still the
+	// sub-ranges inside r that are still missing in the cache. The missing
+	// ranges can be used for parallel prefectches.  Use this only for
+	// large prefetches that are broken down to smaller prefetch threads.
+	// FindMissingRanges(r ranges.Range) (missingRs ranges.Ranges)
+
 	// HasRange returns true if the current ranges entirely include range
 	HasRange(r ranges.Range) bool
 
@@ -94,6 +103,7 @@ type downloader struct {
 	skipped   int64               // number of bytes we have skipped sequentially
 	_closed   bool                // set to true if downloader is closed
 	stop      bool                // set to true if we have called _stop()
+	prefetch  bool                // being used for sequential prefetch
 }
 
 // New makes a downloader for item
@@ -327,26 +337,67 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 		r.Size = 0
 	}
 
+	rBegin := (r.Pos >> 20) << 20
+	rEnd := ((r.Pos + r.Size + 1024*1024 - 1) >> 20) << 20
+	r.Pos = rBegin
+	r.Size = rEnd - rBegin
+
+	err = dls.assignDownloader(r, window, startNew, false)
+	if err != nil {
+		return
+	}
+
+	// Increase the read range by the read ahead if set
+	if dls.opt.SeqReadAhead > 0 && dls.getPrefetchCnt() <= 6 {
+		nextSeqPrefs := dls.item.GetSeqPrefs()
+		for _, prefR := range nextSeqPrefs {
+			err = dls.assignDownloader(prefR, 2*window, true, true)
+			if err != nil {
+				return
+			}
+		}
+	}
+	return
+}
+
+func (dls *Downloaders) getPrefetchCnt() (prefs int) {
+	var dl *downloader
+
+	for _, dl = range dls.dls {
+		_, offset, maxOffset, forPrefetch := dl.getRange()
+		if forPrefetch && maxOffset-offset > 1048576 {
+			prefs++
+		}
+	}
+	return prefs
+}
+
+// call with lock held
+func (dls *Downloaders) assignDownloader(r ranges.Range, window int64, startNew bool, forPrefetch bool) (err error) {
 	var dl *downloader
 	// Look through downloaders to find one in range
 	// If there isn't one then start a new one
 	dls._removeClosed()
 	for _, dl = range dls.dls {
-		start, offset := dl.getRange()
+		start, offset, _, _ := dl.getRange()
 
 		// The downloader's offset to offset+window is the gap
 		// in which we would like to re-use this
 		// downloader. The downloader will never reach before
 		// start and offset+windows is too far away - we'd
 		// rather start another downloader.
-		// fs.Debugf(nil, "r=%v start=%d, offset=%d, found=%v", r, start, offset, r.Pos >= start && r.Pos < offset+window)
+		fs.Debugf(nil, "r=%v start=%d, offset=%d, found=%v", r, start, offset, r.Pos >= start && r.Pos < offset+window)
 		if r.Pos >= start && r.Pos < offset+window {
 			// Found downloader which will soon have our data
-			dl.setRange(r)
+			dl.setRange(r, forPrefetch)
 			return nil
 		}
 	}
 	if !startNew {
+		return nil
+	}
+	// Don't start a new downloader for a small prefetch chunk (< 64MB)
+	if forPrefetch && r.Size < (2<<25) {
 		return nil
 	}
 	// Downloader not found so start a new one
@@ -355,6 +406,7 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 		dls._countErrors(0, err)
 		return errors.Wrap(err, "failed to start downloader")
 	}
+	fs.Debugf(nil, "started a new downloader r=%v dls %v", r, dls)
 	return err
 }
 
@@ -617,12 +669,13 @@ func (dl *downloader) download() (n int64, err error) {
 }
 
 // setRange makes sure the downloader is downloading the range passed in
-func (dl *downloader) setRange(r ranges.Range) {
+func (dl *downloader) setRange(r ranges.Range, forPrefetch bool) {
 	// defer log.Trace(dl.dls.src, "r=%v", r)("")
 	dl.mu.Lock()
 	maxOffset := r.End()
 	if maxOffset > dl.maxOffset {
 		dl.maxOffset = maxOffset
+		dl.prefetch = forPrefetch
 	}
 	dl.mu.Unlock()
 	// fs.Debugf(dl.dls.src, "kicking downloader with maxOffset %d", maxOffset)
@@ -633,8 +686,8 @@ func (dl *downloader) setRange(r ranges.Range) {
 }
 
 // get the current range this downloader is working on
-func (dl *downloader) getRange() (start, offset int64) {
+func (dl *downloader) getRange() (start, offset, maxOffset int64, forPrefetch bool) {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
-	return dl.start, dl.offset
+	return dl.start, dl.offset, dl.maxOffset, dl.prefetch
 }
