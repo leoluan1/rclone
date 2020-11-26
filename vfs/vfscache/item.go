@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"sync"
 	"time"
@@ -1204,7 +1205,10 @@ func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 		}
 		item.c.KickCleaner()
 		expBackOff = 2 << uint(retries)
-		time.Sleep(time.Duration(expBackOff) * time.Millisecond) // Exponential back-off the retries
+		randSeed := rand.NewSource(time.Now().UnixNano())
+		randNo := rand.New(randSeed)
+		randInt := randNo.Intn(16)
+		time.Sleep(time.Duration(randInt*expBackOff) * time.Millisecond) // Exponential back-off the retries
 	}
 
 	if fserrors.IsErrNoSpace(err) {
